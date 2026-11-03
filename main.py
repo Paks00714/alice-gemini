@@ -79,7 +79,7 @@ def call_gemini_http(history: list) -> str:
     headers = {"Content-Type": "application/json"}
     url = f"{GEMINI_URL}?key={API_KEY}"
 
-    response = requests.post(url, json=payload, headers=headers, timeout=10)
+    response = requests.post(url, json=payload, headers=headers, timeout=25)
     
     if response.status_code != 200:
         raise RuntimeError(f"Google API Error {response.status_code}: {response.text[:200]}")
