@@ -1,5 +1,3 @@
-
-
 import os
 import re
 import asyncio
@@ -9,17 +7,27 @@ from google.genai import types
 
 app = FastAPI()
 
-# Берем API-ключ из переменных окружения Render (Environment Variables)
-API_KEY = os.environ.get("GEMINI_API_KEY")
-if not API_KEY:
-    raise RuntimeError("Не задана переменная окружения GEMINI_API_KEY!")
+# Читаем ключ из настроек Render и чистим от случайных пробелов или кавычек
+RAW_KEY = os.environ.get("GEMINI_API_KEY", "")
+API_KEY = RAW_KEY.strip().strip('"').strip("'")
 
-client = genai.Client(api_key=API_KEY)
+def create_genai_client(key: str):
+    if not key:
+        return None
+    # Ключи на AQ. требуют включения режима Vertex AI Express
+    if key.startswith("AQ."):
+        return genai.Client(vertexai=True, api_key=key)
+    return genai.Client(api_key=key)
 
-# Хранилище сессий в оперативной памяти:
-# history — контекст диалога с Gemini
-# task — текущая фоновая задача генерации
-# chunks — очередь кусков длинного ответа
+client = create_genai_client(API_KEY)
+
+# Список моделей по приоритету (если первая недоступна для ключа — сработает следующая)
+MODELS_TO_TRY = [
+    "gemini-2.0-flash",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash-lite",
+]
+
 sessions = {}
 
 SYSTEM_PROMPT = (
@@ -30,12 +38,8 @@ SYSTEM_PROMPT = (
     "сложные списки и куски кода, если об этом прямо не попросили."
 )
 
-# Таймаут перед ответом-заглушкой (лимит Яндекса ~4.5 сек с учетом пинга)
 YANDEX_TIMEOUT = 3.2
-# Максимальная длина одного куска текста (лимит Яндекса — 1024 символа)
 MAX_CHUNK_LEN = 900
-
-# Слова-триггеры для дочитывания ответа
 CONTINUE_WORDS = {"дальше", "продолжай", "ну", "готово", "давай", "что там", "скажи"}
 
 
@@ -50,14 +54,14 @@ def get_session(session_id: str) -> dict:
 
 
 def clean_text_for_tts(text: str) -> str:
-    """Очищает текст от Markdown-символов, чтобы колонка не читала их вслух."""
+    """Очищает текст от Markdown-символов для голосового движка Алисы."""
     text = re.sub(r"[*_#`~>]", "", text)
     text = re.sub(r"\n{2,}", "\n", text)
     return text.strip()
 
 
 def split_into_chunks(text: str, max_len: int = MAX_CHUNK_LEN) -> list[str]:
-    """Разбивает длинный ответ на части по границам предложений."""
+    """Разбивает длинный ответ на части по предложениям под лимит Яндекса (1024 символа)."""
     if len(text) <= max_len:
         return [text]
 
@@ -84,21 +88,32 @@ def split_into_chunks(text: str, max_len: int = MAX_CHUNK_LEN) -> list[str]:
 
 
 def call_gemini_sync(history: list) -> str:
-    """Синхронный запрос к Gemini API."""
-    res = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=history,
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            max_output_tokens=800,
-            temperature=0.7
-        )
-    )
-    return clean_text_for_tts(res.text or "Пустой ответ от модели.")
+    """Пробует отправить запрос по очереди к доступным моделям Gemini."""
+    if not client:
+        raise RuntimeError("Не задана переменная GEMINI_API_KEY в настройках Render!")
+
+    last_error = None
+    for model_name in MODELS_TO_TRY:
+        try:
+            res = client.models.generate_content(
+                model=model_name,
+                contents=history,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT,
+                    max_output_tokens=800,
+                    temperature=0.7
+                )
+            )
+            return clean_text_for_tts(res.text or "Пустой ответ от модели.")
+        except Exception as e:
+            last_error = e
+            continue
+
+    raise RuntimeError(f"Не удалось получить ответ ни от одной модели. Детали: {last_error}")
 
 
 async def generate_in_background(session: dict, user_text: str) -> str:
-    """Запускает генерацию в пуле потоков и обновляет историю диалога."""
+    """Запускает генерацию в фоне и сохраняет контекст диалога."""
     current_history = session["history"] + [
         types.Content(role="user", parts=[types.Part.from_text(text=user_text)])
     ]
@@ -108,7 +123,6 @@ async def generate_in_background(session: dict, user_text: str) -> str:
     session["history"] = current_history + [
         types.Content(role="model", parts=[types.Part.from_text(text=reply)])
     ]
-    # Храним последние 20 реплик (10 пар вопрос-ответ)
     if len(session["history"]) > 20:
         session["history"] = session["history"][-20:]
 
@@ -116,7 +130,7 @@ async def generate_in_background(session: dict, user_text: str) -> str:
 
 
 def make_response(data: dict, text: str, end_session: bool = False, show_continue_btn: bool = False) -> dict:
-    """Формирует JSON-ответ по спецификации Яндекс Диалогов."""
+    """Формирует ответ в формате Яндекс Диалогов."""
     resp = {
         "version": data.get("version", "1.0"),
         "session": data.get("session", {}),
@@ -132,7 +146,7 @@ def make_response(data: dict, text: str, end_session: bool = False, show_continu
 
 
 def pop_next_chunk_response(data: dict, session: dict) -> dict:
-    """Отдает следующий кусок ответа из очереди."""
+    """Выдает следующий кусок длинного ответа."""
     chunk = session["chunks"].pop(0)
     if session["chunks"]:
         suffix = " ... Скажи «Дальше», чтобы дослушать."
@@ -143,8 +157,44 @@ def pop_next_chunk_response(data: dict, session: dict) -> dict:
 @app.get("/")
 @app.get("/ping")
 async def ping():
-    """Эндпоинт для проверки жизни сервера и защиты от сна (Cron-job / UptimeRobot)."""
-    return {"status": "alive", "service": "alice-gemini-webhook"}
+    """Проверка жизни сервера для UptimeRobot / Cron-job."""
+    return {
+        "status": "alive",
+        "service": "alice-gemini-webhook",
+        "key_configured": bool(API_KEY),
+        "mode": "vertexai (AQ.)" if API_KEY.startswith("AQ.") else "aistudio (AIzaSy)"
+    }
+
+
+@app.get("/check")
+def check_in_browser():
+    """Диагностическая страница: открой в браузере https://твой-сервис.onrender.com/check"""
+    if not API_KEY:
+        return {"ok": False, "error": "Переменная GEMINI_API_KEY пустая в настройках Render!"}
+
+    results = {}
+    for model_name in MODELS_TO_TRY:
+        try:
+            res = client.models.generate_content(
+                model=model_name,
+                contents="Ответь одним словом: Работает!"
+            )
+            return {
+                "ok": True,
+                "key_prefix": API_KEY[:6] + "...",
+                "mode": "vertexai=True" if API_KEY.startswith("AQ.") else "standard",
+                "working_model": model_name,
+                "test_reply": res.text.strip()
+            }
+        except Exception as e:
+            results[model_name] = str(e)
+
+    return {
+        "ok": False,
+        "key_prefix": API_KEY[:6] + "...",
+        "mode": "vertexai=True" if API_KEY.startswith("AQ.") else "standard",
+        "errors_by_model": results
+    }
 
 
 @app.post("/alice-webhook")
@@ -174,7 +224,7 @@ async def alice_webhook(request: Request):
         sessions.pop(session_id, None)
         return make_response(data, "Контекст очищен. О чем поговорим?")
 
-    # 4. Обработка команды «Дальше»
+    # 4. Команда «Дальше»
     if user_lower in CONTINUE_WORDS:
         if session["chunks"]:
             return pop_next_chunk_response(data, session)
@@ -197,11 +247,11 @@ async def alice_webhook(request: Request):
                 session["chunks"] = split_into_chunks(full_reply)
                 return pop_next_chunk_response(data, session)
             except Exception as e:
-                return make_response(data, f"Вылезла ошибка при генерации: {str(e)[:60]}")
+                return make_response(data, f"Ошибка генерации: {str(e)[:80]}")
 
         return make_response(data, "В очереди ничего нет. Задавай новый вопрос!")
 
-    # 5. Обработка нового вопроса
+    # 5. Новый вопрос
     if session["task"] and not session["task"].done():
         session["task"].cancel()
     session["chunks"].clear()
@@ -223,4 +273,4 @@ async def alice_webhook(request: Request):
         )
     except Exception as e:
         session["task"] = None
-        return make_response(data, f"Ошибка связи с Gemini: {str(e)[:60]}")
+        return make_response(data, f"Ошибка связи с Gemini: {str(e)[:80]}")
