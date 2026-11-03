@@ -10,7 +10,7 @@ RAW_KEY = os.environ.get("GEMINI_API_KEY", "")
 API_KEY = RAW_KEY.strip().strip('"').strip("'")
 
 # Используем прямой REST API Google по модели flash
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent"
 
 sessions = {}
 
